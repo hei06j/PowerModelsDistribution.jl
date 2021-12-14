@@ -7,20 +7,21 @@
 
 using Pkg
 Pkg.activate("./scripts")
-# Pkg.add("./")
+# Pkg.add("./") # to add the local package instead of the remote/online package
 using PowerModelsDistribution
 const _PMD=PowerModelsDistribution
 
 
 # case_file = joinpath(dirname(pathof(PowerModelsDistribution)), "../test/data/en_validation_case_data/test_gen_3ph_wye.dss")
-case_file = joinpath(dirname(pathof(PowerModelsDistribution)), "../test/data/en_validation_case_data/test_trans_dy.dss")
+case_file = joinpath(pwd()*"/test/data/en_validation_case_data/test_trans_dy.dss")
 
-##
 # I = [1 0 0 0; 0 1 0 0 ; 0 0 1 0; 0 0 0 1]
 # I = [1 0 0; 0 1 0 ; 0 0 1]
 
 eng =_PMD.parse_file(case_file)
 math = transform_data_model(eng;kron_reduce=false)
+
+##
 
 # math["branch"]["2"]["br_r"] = 1E-3.*I
 # math["branch"]["2"]["br_x"] = 1E-3.*I

@@ -6,7 +6,64 @@ Pkg.activate("./examples")
 using PowerModelsDistribution
 const PMD = PowerModelsDistribution
 
+using JSON
+
 ##
+function compare_sol_dss_pmd(sol_dss::Dict{String,Any}, sol_pmd::Dict{String,Any}, data_eng::Dict{String,Any}, data_math::Dict{String,Any}; compare_math=false, verbose=true, floating_buses=[], skip_buses=[], v_err_print_tol=1E-6)
+    max_v_err_pu = 0.0
+
+    # voltage base for ENGINEERING buses in [V]
+    vbase = Dict(id=>data_math["bus"]["$ind"]["vbase"]*data_math["settings"]["voltage_scale_factor"] for (id,ind) in data_math["bus_lookup"])
+
+    buses_intersected = intersect(keys(sol_dss["bus"]), keys(sol_pmd["bus"]))
+    for id in setdiff(buses_intersected, skip_buses)
+        pmd_bus = sol_pmd["bus"][id]
+        dss_bus = sol_dss["bus"][id]
+
+        terminals = data_eng["bus"][id]["terminals"]
+        if compare_math
+            ts = [t for t in string.(terminals) if haskey(dss_bus["vm"], t)]
+            v_dss = [dss_bus["vm"][t]*exp(im*dss_bus["va"][t]) for t in ts]
+            # convert to V instead of usual kV
+            v_pmd = [pmd_bus["vm"][t]*exp(im*deg2rad(pmd_bus["va"][t]))*data_eng["settings"]["voltage_scale_factor"] for t in ts]
+        else
+            ts = [t for t in terminals if haskey(dss_bus["vm"], t)]
+            v_dss = [dss_bus["vm"][t]*exp(im*dss_bus["va"][t]) for t in ts]
+            # convert to V instead of usual kV
+            v_pmd = [(pmd_bus["vr"][idx]+im*pmd_bus["vi"][idx])*data_eng["settings"]["voltage_scale_factor"] for (idx,t) in enumerate(ts)]
+        end
+        
+        # convert to pu
+        v_dss_pu = v_dss/vbase[id]
+        v_pmd_pu = v_pmd/vbase[id]
+
+        # convert to diffs if floating
+        N = length(v_dss)
+        if id in floating_buses && N>1
+            v_dss_pu = [v_dss_pu[i]-v_dss_pu[j] for i in 1:N for j in i:N if i!=j]/vbase[id]
+            v_pmd_pu = [v_pmd_pu[i]-v_pmd_pu[j] for i in 1:N for j in i:N if i!=j]/vbase[id]
+            labels = ["$(ts[i])-$(ts[j])" for i in 1:N for j in i:N if i!=j]
+        else
+            labels = string.(ts)
+        end
+
+        for i in 1:length(v_pmd_pu)
+            v_err_pu = abs.(v_dss_pu[i]-v_pmd_pu[i]); max_v_err_pu = max(max_v_err_pu, v_err_pu)
+
+            if v_err_pu>v_err_print_tol && verbose
+                println("terminal $id.$(labels[i])")
+                println("\t |U| dss: $(abs(v_dss_pu[i]))")
+                println("\t     pmd: $(abs(v_pmd_pu[i]))")
+                println("\t  ∠U dss:  $(angle(v_dss_pu[i]))")
+                println("\t     pmd:  $(angle(v_pmd_pu[i]))")
+            end
+        end
+    end
+
+    return max_v_err_pu
+end
+
+
 function vsource_correction_to_4w!(data_eng)
     if haskey(data_eng, "multinetwork")
         for (n,nw) in data_eng["nw"]
@@ -217,54 +274,89 @@ end
 
 
 ## 3 wire   ---  get these files from  https://github.com/sanderclaeys/DistributionTestCases.jl
-# case_path = "./examples/IEEE testcases Sander/ieee13_pmd.dss"
-# case_path = "./examples/IEEE testcases Sander/ieee34_pmd.dss"
-case_path = "./examples/IEEE testcases Sander/ieee123_pmd.dss"
+case = "ieee13_pmd"
+case = "ieee34_pmd"
+case = "ieee123_pmd"
 
-data_eng = parse_file(case_path, transformations=[transform_loops!, remove_all_bounds!])
+data_eng = parse_file("$data_dir/$case.dss", transformations=[transform_loops!])
 data_eng["is_kron_reduced"] = true
 data_eng["settings"]["sbase_default"] = 1
 vsource_correction_to_3w!(data_eng)
-
 data_math = transform_data_model(data_eng;kron_reduce=false, phase_project=false)
 sourcebus_voltage_vector_correction!(data_math, explicit_neutral=false)
 update_math_model_3wire!(data_math)
+res = compute_pf(data_math; explicit_neutral=false)
+# obtain solution from dss
+sol_dss = open("$solution_dir/$case.json", "r") do f
+    JSON.parse(f)
+end
+sol_pmd = transform_solution(res["solution"], data_math, make_si=true)
+v_maxerr_pu = compare_sol_dss_pmd(sol_dss, sol_pmd, data_eng, data_math, verbose=false, compare_math=true)
 
-res = PowerModelsDistribution.compute_pf(data_math; explicit_neutral=false)
-
-
-## 4 wire
-case_path = "test/data/en_validation_case_data/test_trans_dy.dss"
-data_eng = parse_file(case_path, transformations=[transform_loops!, remove_all_bounds!])
-vsource_correction_to_4w!(data_eng)
-data_math = transform_data_model(data_eng;kron_reduce=false, phase_project=false)
-res = PowerModelsDistribution.compute_pf(data_math; explicit_neutral=true)
-
-
-## adapt the script by comparing a 4wire and 3wire testcase -> add_start_voltage!(dm, coordinates=:rectangular, epsilon=0) ???
-case_path = "./test/data/opendss/ut_trans_2w_dy_lag.dss"
-data_eng = parse_file(case_path, transformations=[transform_loops!])
-vsource_correction_to_4w!(data_eng)
-data_math = transform_data_model(data_eng;kron_reduce=false)
-res = PowerModelsDistribution.compute_pf(data_math; explicit_neutral=true)
 
 
 ## 3wire and 4wire ENWL testcases
-case_path_4w = "./examples/ENWL testcases/four-wire with explicit_neutral"
-cd(case_path_4w)
-data_eng = parse_file("Master.dss", transformations=[transform_loops!])
+data_dir = "examples/native_pf_testcases"
+solution_dir = "examples/native_pf_testcases/solutions"
+
+case = "test_trans_dy"
+data_eng = parse_file("$data_dir/$case.dss", transformations=[transform_loops!])
 vsource_correction_to_4w!(data_eng)
 data_math = transform_data_model(data_eng;kron_reduce=false)
-res = PowerModelsDistribution.compute_pf(data_math; explicit_neutral=true)
+res = compute_pf(data_math; explicit_neutral=true)
+# obtain solution from dss
+sol_dss = open("$solution_dir/$case.json", "r") do f
+    JSON.parse(f)
+end
+sol_pmd = transform_solution(res["solution"], data_math, make_si=true)
+v_maxerr_pu = compare_sol_dss_pmd(sol_dss, sol_pmd, data_eng, data_math, verbose=false, compare_math=true)
 
-cd("../three-wire")
-data_eng = parse_file("Master.dss", transformations=[transform_loops!])
-data_eng["is_kron_reduced"] = true
-vsource_correction_to_3w!(data_eng)
+
+case = "test_trans_yy"
+data_eng = parse_file("$data_dir/$case.dss", transformations=[transform_loops!])
+vsource_correction_to_4w!(data_eng)
 data_math = transform_data_model(data_eng;kron_reduce=false)
+res = compute_pf(data_math; explicit_neutral=true)
+# obtain solution from dss
+sol_dss = open("$solution_dir/$case.json", "r") do f
+    JSON.parse(f)
+end
+sol_pmd = transform_solution(res["solution"], data_math, make_si=true)
+v_maxerr_pu = compare_sol_dss_pmd(sol_dss, sol_pmd, data_eng, data_math, verbose=false, compare_math=true)
+
+
+case = "test_trans_dy_3w"
+data_eng = parse_file("$data_dir/$case.dss", transformations=[transform_loops!])
+data_eng["is_kron_reduced"] = true
+data_eng["settings"]["sbase_default"] = 1
+vsource_correction_to_3w!(data_eng)
+data_math = transform_data_model(data_eng;kron_reduce=false, phase_project=false)
 sourcebus_voltage_vector_correction!(data_math, explicit_neutral=false)
 update_math_model_3wire!(data_math)
-res = PowerModelsDistribution.compute_pf(data_math; explicit_neutral=false)
+res = compute_pf(data_math; explicit_neutral=false)
+# obtain solution from dss
+sol_dss = open("$solution_dir/$case.json", "r") do f
+    JSON.parse(f)
+end
+sol_pmd = transform_solution(res["solution"], data_math, make_si=true)
+v_maxerr_pu = compare_sol_dss_pmd(sol_dss, sol_pmd, data_eng, data_math, verbose=false, compare_math=true)
+
+
+case = "test_trans_yy_3w"
+data_eng = parse_file("$data_dir/$case.dss", transformations=[transform_loops!])
+data_eng["is_kron_reduced"] = true
+data_eng["settings"]["sbase_default"] = 1
+vsource_correction_to_3w!(data_eng)
+data_math = transform_data_model(data_eng;kron_reduce=false, phase_project=false)
+sourcebus_voltage_vector_correction!(data_math, explicit_neutral=false)
+update_math_model_3wire!(data_math)
+res = compute_pf(data_math; explicit_neutral=false)
+# obtain solution from dss
+sol_dss = open("$solution_dir/$case.json", "r") do f
+    JSON.parse(f)
+end
+sol_pmd = transform_solution(res["solution"], data_math, make_si=true)
+v_maxerr_pu = compare_sol_dss_pmd(sol_dss, sol_pmd, data_eng, data_math, verbose=false, compare_math=true)
 
 
 ##
@@ -278,45 +370,3 @@ res = PowerModelsDistribution.compute_pf(data_math; explicit_neutral=false)
 
 ## solution builder - > make sure load currents are in dict (phase->cr, ci) format
 
-##
-data_dir = "test/data/en_validation_case_data"
-cases = [x[1:end-4] for x in readdir(data_dir) if endswith(x, ".dss")]
-
-case = "test_load_1ph_delta_cp"
-case_path = "$data_dir/$case.dss"
-
-data_eng = parse_file(case_path, transformations=[transform_loops!])
-vsource_correction_to_4w!(data_eng)
-
-data_math = transform_data_model(data_eng;kron_reduce=false)
-
-res = compute_pf(data_math; explicit_neutral=true)
-
-##
-
-vm = [v for (i,v) in sort(res["solution"]["bus"]["1"]["vm"])]  # load bus
-va = [v for (i,v) in sort(res["solution"]["bus"]["1"]["va"])]
-v = vm .* exp.(va*im)
-
-# c2r = res["solution"]["load"]["2"]["cdr"]
-# c2i = res["solution"]["load"]["2"]["cdi"]
-# c2 = c2r .+ im*c2i
-# S2 = (v[2] - v[3]) * c2[1]'
-
-c1r = res["solution"]["load"]["1"]["cdr"]
-c1i = res["solution"]["load"]["1"]["cdi"]
-c1 = c1r .+ im*c1i
-S1 = (v[1] - v[4]) * c1[1]'
-
-
-##
-vm = [v for (i,v) in sort(res["solution"]["bus"]["3"]["vm"])]  # source bus
-va = [v for (i,v) in sort(res["solution"]["bus"]["3"]["va"])]
-v = vm .* exp.(va*im)
-
-cr_branch = res["solution"]["branch"]["2"]["cr"][1:4]
-ci_branch = res["solution"]["branch"]["2"]["ci"][1:4]
-c_banch = cr_branch .+ im*ci_branch
-
-using LinearAlgebra
-Ssource = diag(v * c_banch')
